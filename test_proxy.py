@@ -16,6 +16,13 @@ MULTI_PARAM = (
 )
 TWO_CALLS = NO_PARAMS + "\n" + ONE_PARAM
 
+# Degenerate variant seen in a second eval (HA Assist, 13-tool schema): no
+# opening <function=> tag, dangling unmatched closing </function>.
+BARE_NO_WRAPPER = (
+    "<tool_call> HassTurnOn\n<parameter=name>\nKitchen Island\n</parameter>\n"
+    "<parameter=area>\nKitchen\n</parameter>\n</function>\n</tool_call>"
+)
+
 
 def test_no_params():
     calls = parse_leaked_tool_calls(NO_PARAMS)
@@ -47,6 +54,13 @@ def test_two_calls():
 def test_call_ids_unique():
     calls = parse_leaked_tool_calls(TWO_CALLS)
     assert calls[0]["id"] != calls[1]["id"]
+
+
+def test_bare_no_wrapper_variant():
+    calls = parse_leaked_tool_calls(BARE_NO_WRAPPER)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "HassTurnOn"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"name": "Kitchen Island", "area": "Kitchen"}
 
 
 def test_plain_text_not_matched():

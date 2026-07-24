@@ -39,7 +39,10 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOOL_CALL_BLOCK_RE = re.compile(
-    r"<tool_call>\s*<function=([a-zA-Z_][a-zA-Z0-9_]*)>(.*?)</function>\s*</tool_call>",
+    # Handles two observed leak shapes: "<function=NAME>...</function>" and a
+    # degenerate "<tool_call> NAME ...</function>" (no opening <function=> tag,
+    # dangling closing one) -- both wrap the same <parameter=...> body.
+    r"<tool_call>\s*(?:<function=)?([a-zA-Z_][a-zA-Z0-9_]*)>?(.*?)(?:</function>\s*)?</tool_call>",
     re.DOTALL,
 )
 PARAM_RE = re.compile(r"<parameter=([a-zA-Z_][a-zA-Z0-9_]*)>\s*(.*?)\s*</parameter>", re.DOTALL)
