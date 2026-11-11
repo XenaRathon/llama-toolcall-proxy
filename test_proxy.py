@@ -1,6 +1,14 @@
+import gzip
 import json
+import os
+import threading
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import patch
 
 from proxy import (
+    ProxyHandler,
+    _filter_headers,
     parse_leaked_tool_calls,
     repair_message,
     repair_nonstream_body,
@@ -190,3 +198,160 @@ def test_repair_stream_body_passthrough_when_already_structured():
 
 def test_repair_stream_body_passthrough_on_empty():
     assert repair_stream_body(b"") == b""
+
+
+def test_filter_headers_drops_hop_by_hop():
+    headers = [
+        ("Connection", "Keep-Alive, close"),
+        ("Keep-Alive", "timeout=5, max=1000"),
+        ("TE", "trailers, deflate"),
+        ("Trailer", "Max-Forwards"),
+        ("Transfer-Encoding", "chunked"),
+        ("Upgrade", "h2c"),
+        ("Proxy-Authenticate", "Basic"),
+        ("Accept", "*/*"),
+        ("Accept-Encoding", "gzip"),
+        ("Host", "example.com"),
+    ]
+    filtered = _filter_headers(headers)
+    assert filtered == [("Accept", "*/*"), ("Accept-Encoding", "gzip"), ("Host", "example.com")]
+
+
+def test_filter_headers_drops_connection_tokens():
+    headers = [
+        ("Connection", "X-Custom-Header, Keep-Alive"),
+        ("X-Custom-Header", "foo"),
+        ("Keep-Alive", "timeout=5"),
+        ("Accept", "*/*"),
+    ]
+    filtered = _filter_headers(headers)
+    assert filtered == [("Accept", "*/*")]
+
+
+class MockUpstream(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        pass
+
+    def _handle(self):
+        body = b""
+        if "Content-Length" in self.headers:
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+
+        if self.path == "/v1/chat/completions/gzipped":
+            # Test verifies that proxy sends identity
+            assert self.headers.get("Accept-Encoding") == "identity"
+            resp = json.dumps(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": ONE_PARAM},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+            # Upstream respects identity and returns raw uncompressed response
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+
+        if self.path == "/v1/test_methods":
+            self.send_response(200)
+            self.send_header("X-Method-Received", self.command)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        self.send_response(200)
+        self.send_header("Connection", "Keep-Alive")
+        self.send_header("Keep-Alive", "timeout=5")
+        self.send_header("X-Received-Method", self.command)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def do_GET(self): self._handle()
+    def do_POST(self): self._handle()
+    def do_PUT(self): self._handle()
+    def do_DELETE(self): self._handle()
+
+
+def test_proxy_e2e():
+    upstream = HTTPServer(("127.0.0.1", 0), MockUpstream)
+    upstream_port = upstream.server_port
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+
+    ProxyHandler.upstream = f"http://127.0.0.1:{upstream_port}"
+    ProxyHandler.timeout = 5.0
+    proxy = HTTPServer(("127.0.0.1", 0), ProxyHandler)
+    proxy_port = proxy.server_port
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+
+    try:
+
+        # Test 1: gzipped JSON body is requested as identity and thus repaired successfully
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{proxy_port}/v1/chat/completions/gzipped",
+            data=b"{}",
+            method="POST",
+        )
+        req.add_header("Accept-Encoding", "gzip")
+        with urllib.request.urlopen(req) as resp:
+            data = resp.read()
+            payload = json.loads(data.decode("utf-8"))
+            # Repaired!
+            assert payload["choices"][0]["finish_reason"] == "tool_calls"
+            assert payload["choices"][0]["message"]["content"] is None
+
+        # Test 2: Hop-by-hop headers dropped and proxy works for other endpoints
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{proxy_port}/v1/other",
+            data=b"{}",
+            method="POST",
+        )
+        req.add_header("Connection", "Keep-Alive")
+        with urllib.request.urlopen(req) as resp:
+            assert resp.getheader("Connection") is None
+            assert resp.getheader("Keep-Alive") is None
+
+        # Test 3: PUT/DELETE methods pass through
+        for method in ("PUT", "DELETE"):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_port}/v1/test_methods",
+                data=b"{}",
+                method=method,
+            )
+            with urllib.request.urlopen(req) as resp:
+                assert resp.getheader("X-Method-Received") == method
+                assert resp.read() == b"{}"
+    finally:
+        upstream.shutdown()
+        proxy.shutdown()
+
+
+@patch("os.environ.get")
+@patch("sys.stderr.write")
+@patch("proxy.ThreadingHTTPServer")
+def test_timeout_env_var_read(mock_server, mock_stderr, mock_environ):
+    def env_side_effect(key, default=None):
+        if key == "UPSTREAM_URL":
+            return "http://example.com"
+        if key == "UPSTREAM_TIMEOUT":
+            return "42.5"
+        return default
+
+    mock_environ.side_effect = env_side_effect
+
+    # Run main which will start the server blockingly, so we need to mock serve_forever
+    mock_server.return_value.serve_forever.side_effect = KeyboardInterrupt
+    from proxy import main
+    main()
+
+    # Test that the timeout was set on the class correctly
+    assert ProxyHandler.timeout == 42.5

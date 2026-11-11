@@ -85,7 +85,8 @@ def repair_message(message):
 def repair_nonstream_body(raw_bytes):
     try:
         payload = json.loads(raw_bytes)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        sys.stderr.write(f"[proxy] failed to parse body for repair: {e}\n")
         return raw_bytes
     changed = False
     for choice in payload.get("choices", []):
@@ -179,8 +180,34 @@ def repair_stream_body(raw_bytes):
     return body.encode("utf-8")
 
 
+def _filter_headers(headers_items):
+    hop_by_hop = {
+        "connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+    connection_header = next((v for k, v in headers_items if k.lower() == "connection"), "")
+    if connection_header:
+        for token in connection_header.split(","):
+            token = token.strip().lower()
+            if token:
+                hop_by_hop.add(token)
+
+    filtered = []
+    for k, v in headers_items:
+        k_lower = k.lower()
+        if k_lower in hop_by_hop or k_lower.startswith("proxy-"):
+            continue
+        filtered.append((k, v))
+    return filtered
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
     upstream = None  # set in main()
+    timeout = 300.0  # set in main()
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[proxy] " + (fmt % args) + "\n")
@@ -197,19 +224,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         url = self.upstream.rstrip("/") + self.path
         req = urllib.request.Request(url, data=body or None, method=self.command)
-        for h, v in self.headers.items():
-            if h.lower() in ("host", "content-length"):
+
+        filtered_req_headers = _filter_headers(list(self.headers.items()))
+        for h, v in filtered_req_headers:
+            h_lower = h.lower()
+            if h_lower in ("host", "content-length", "accept-encoding"):
                 continue
             req.add_header(h, v)
+        req.add_header("Accept-Encoding", "identity")
 
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 status = resp.status
-                headers = [(h, v) for h, v in resp.getheaders() if h.lower() not in ("content-length", "transfer-encoding")]
+                headers = [(h, v) for h, v in _filter_headers(resp.getheaders()) if h.lower() != "content-length"]
                 raw = resp.read()
         except urllib.error.HTTPError as e:
             status = e.code
-            headers = [(h, v) for h, v in e.headers.items() if h.lower() not in ("content-length", "transfer-encoding")]
+            headers = [(h, v) for h, v in _filter_headers(e.headers.items()) if h.lower() != "content-length"]
             raw = e.read()
         except urllib.error.URLError as e:
             self.send_response(502)
@@ -234,17 +265,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self._proxy()
 
+    def do_PUT(self):
+        self._proxy()
+
+    def do_DELETE(self):
+        self._proxy()
+
 
 def main():
     upstream = os.environ.get("UPSTREAM_URL")
     if not upstream:
         sys.exit("UPSTREAM_URL is required, e.g. http://192.168.1.196:8090 (root, no /v1)")
+
+    timeout_str = os.environ.get("UPSTREAM_TIMEOUT", "300")
+    try:
+        timeout = float(timeout_str)
+    except ValueError:
+        sys.stderr.write(f"[proxy] invalid UPSTREAM_TIMEOUT {timeout_str!r}, defaulting to 300\n")
+        timeout = 300.0
+
     host = os.environ.get("LISTEN_HOST", "0.0.0.0")
     port = int(os.environ.get("LISTEN_PORT", "8091"))
 
     ProxyHandler.upstream = upstream
+    ProxyHandler.timeout = timeout
     server = ThreadingHTTPServer((host, port), ProxyHandler)
-    print(f"[proxy] listening on {host}:{port} -> {upstream}", flush=True)
+    print(f"[proxy] listening on {host}:{port} -> {upstream} (timeout {timeout}s)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
